@@ -7,7 +7,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
 from . import db, service
-from .schemas import RedflushIn, RoundIn
+from .schemas import AuditOut, RedflushIn, RoundIn
 
 
 @asynccontextmanager
@@ -85,3 +85,25 @@ def list_receipts(round_id: str):
 def get_receipt(round_id: str, batch_no: str):
     with db.read_conn() as conn:
         return service.get_receipt(conn, round_id, batch_no)
+
+
+@app.get(
+    "/rounds/{round_id}/redflush-batches/{batch_no}/audit",
+    tags=["查询"],
+    summary="核查回执：当时备选票还能不能多补（只读）",
+    response_model=AuditOut,
+    response_model_exclude_none=False,
+)
+def audit_receipt(round_id: str, batch_no: str):
+    """按轮次与批号核查一张冲红回执，只读，不改变任何名单。
+
+    - 口径：本批剔除冲红票之后、分配替补之前的备选池；共享备选只算一张。
+    - 回执有缺额时，返回备选不足的专题组、组内各专题补样前缺额、该组当时可用的
+      全部备选票号（跨专题共享只列一次），并核验
+      “组内缺额合计 - 备选票数 == 回执全轮剩余缺额”。
+    - 回执无缺额时 `status=fully_filled`、`message=已补满`、`topic_group=null`。
+    - 结果只由 seq 不晚于本批的历史记录重放得出：升级前已生效的批次同样可查，
+      此后再冲红也不会改变本接口的核查结果。
+    """
+    with db.read_tx() as conn:
+        return service.audit_receipt(conn, round_id, batch_no)

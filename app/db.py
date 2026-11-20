@@ -113,3 +113,28 @@ def read_conn():
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def read_tx():
+    """只读快照事务：多条 SELECT 看到同一个一致性视图。
+
+    WAL 模式下未包事务的每条 SELECT 各自取快照；核查要读清册、历史回执等多张表，
+    必须包在一个读事务里，避免并发冲红造成表间时点不一致。
+    """
+    conn = connect()
+    began = False
+    try:
+        conn.execute("BEGIN")
+        began = True
+        yield conn
+        conn.execute("COMMIT")
+    except BaseException:
+        if began:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        conn.close()

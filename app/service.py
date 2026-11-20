@@ -1,7 +1,8 @@
-"""业务逻辑：登记清册、处理冲红批、查询现行名单与回执。
+"""业务逻辑：登记清册、处理冲红批、查询现行名单与回执、历史回执核查。
 
 所有写函数都必须在 db.immediate_tx() 事务内调用：
 查重 -> 整批退出 -> 计算缺额 -> 最大匹配补样 -> 写回执，要么全部生效，要么整体回滚。
+核查函数是只读的：从历史回执重放当时状态，不读现行名单，因此后续冲红不影响结果。
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from .matching import allocate
+from .matching import allocate, deficiency_group
 
 
 class ApiError(Exception):
@@ -280,3 +281,116 @@ def list_receipts(conn, round_id: str) -> list[dict]:
             "SELECT receipt_json FROM batches WHERE round_id=? ORDER BY seq", (round_id,)
         ).fetchall()
     ]
+
+
+# ---------------------------------------------------------------- 回执核查（只读）
+
+def audit_receipt(conn, round_id: str, batch_no: str) -> dict:
+    """核查某张冲红回执：当时还能用的备选票共有多少，缺额能不能补齐。
+
+    核查口径（时间切片在“本批剔除冲红票之后、分配替补之前”）：
+    - 从登记清册出发重建备选池，按生效顺序扣掉此前各批（seq 更小）的冲红票号
+      与已消耗的替补票号，再扣掉本批的冲红票号；
+    - 各专题的缺额直接取回执里的 vacancy_before（本批剔除后、补样前）；
+    - 用与补样相同的二部图求“备选不足”的专题组：该组缺额合计减去其备选并集
+      （跨专题共享的票只算一次）恰好等于回执的全轮剩余缺额。
+
+    只读取 rounds/topics/candidates/batches 四张表，且只看 seq <= 本批的历史记录，
+    不读现行 samples/candidates 状态，因此批号在升级前生效、或之后又发生冲红，
+    都不影响核查结果。
+    """
+    row = conn.execute(
+        "SELECT seq, receipt_json FROM batches WHERE round_id=? AND batch_no=?",
+        (round_id, batch_no),
+    ).fetchone()
+    if not row:
+        if not conn.execute("SELECT 1 FROM rounds WHERE round_id=?", (round_id,)).fetchone():
+            raise ApiError(404, f"轮次不存在: {round_id}")
+        raise ApiError(404, f"回执不存在: {round_id}/{batch_no}")
+
+    seq = row["seq"]
+    receipt = json.loads(row["receipt_json"])
+    order = [
+        t["topic_code"]
+        for t in conn.execute(
+            "SELECT topic_code FROM topics WHERE round_id=? ORDER BY position", (round_id,)
+        ).fetchall()
+    ]
+    vacancies = {t["topic_code"]: t["vacancy_before"] for t in receipt["topics"]}
+
+    # 登记清册里的备选（按登记顺序），作为重建备选池的基线
+    roster_cands = {
+        tc: [
+            r["invoice_no"]
+            for r in conn.execute(
+                "SELECT invoice_no FROM candidates"
+                " WHERE round_id=? AND topic_code=? ORDER BY position",
+                (round_id, tc),
+            ).fetchall()
+        ]
+        for tc in order
+    }
+
+    # 本批之前已退出备选池的票：此前各批的冲红票号 + 此前各批补掉的替补票号
+    unavailable = set(receipt["invoice_nos"])
+    for earlier in conn.execute(
+        "SELECT receipt_json FROM batches WHERE round_id=? AND seq<? ORDER BY seq",
+        (round_id, seq),
+    ).fetchall():
+        er = json.loads(earlier["receipt_json"])
+        unavailable.update(er["invoice_nos"])
+        for t in er["topics"]:
+            unavailable.update(t["replacements"])
+
+    available = {
+        tc: [inv for inv in roster_cands[tc] if inv not in unavailable] for tc in order
+    }
+
+    group, unmatched, _max_fillable = deficiency_group(order, vacancies, available)
+    round_shortfall = sum(t["shortfall"] for t in receipt["topics"])
+
+    group_cands: list[str] = []
+    seen = set()
+    for tc in group:
+        for inv in available[tc]:
+            if inv not in seen:  # 跨专题共享的备选只列一次
+                seen.add(inv)
+                group_cands.append(inv)
+    vacancy_total = sum(vacancies[tc] for tc in group)
+    difference = vacancy_total - len(group_cands)
+
+    matches = difference == round_shortfall == unmatched
+    if not matches:
+        status, message = "inconsistent", "回执与重建的备选池不一致，请核对数据"
+    elif round_shortfall == 0:
+        status, message = "fully_filled", "已补满"
+    else:
+        status, message = "shortfall", "备选不足，仍有缺额"
+
+    return {
+        "round_id": round_id,
+        "batch_no": batch_no,
+        "seq": seq,
+        "status": status,
+        "message": message,
+        "round_shortfall": round_shortfall,
+        "total_filled": receipt["total_filled"],
+        "topic_group": None
+        if not group
+        else {
+            "topics": [
+                {"topic_code": tc, "vacancy_before": vacancies[tc]} for tc in group
+            ],
+            "vacancy_before_total": vacancy_total,
+            "candidates": group_cands,
+            "candidate_count": len(group_cands),
+            "shortfall": difference,
+        },
+        "check": {
+            "vacancy_before_total": vacancy_total,
+            "candidate_count": len(group_cands),
+            "difference": difference,
+            "round_shortfall": round_shortfall,
+            "matches": matches,
+        },
+    }

@@ -1,6 +1,8 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      target: base
     image: redflush-api:latest
     ports:
       - "8000:8000"
@@ -9,6 +11,26 @@ services:
     volumes:
       - appdata:/data   # SQLite 落盘，容器重启后现行名单与回执仍可查
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # 演示：等 api 就绪后跑一遍“共享备选不足的批次怎么核查”，退出即结束。
+  #   docker compose run --rm demo
+  # 打开 http://localhost:8000/docs 可手工在 Swagger 里做同样的操作。
+  demo:
+    build:
+      context: .
+      target: demo
+    image: redflush-api-demo:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    entrypoint: ["python", "scripts/audit_demo.py", "http://api:8000"]
+    profiles: ["demo"]
+    restart: "no"
 
 volumes:
   appdata:
