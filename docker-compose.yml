@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: redflush-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/app.db
+    volumes:
+      - appdata:/data   # SQLite 落盘，容器重启后现行名单与回执仍可查
+    restart: unless-stopped
+
+volumes:
+  appdata:
